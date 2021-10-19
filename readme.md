@@ -2,7 +2,7 @@
 npm install
 ```
 
-#### to deploy to rinkeby execute 
+#### to deploy in rinkeby execute 
 ```sh
 npm run deploy_farm_bsc_testnet
 ```
