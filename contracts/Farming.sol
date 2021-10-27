@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.6;
+pragma solidity ^0.8.6;
 
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
@@ -11,13 +11,30 @@ contract Farming is AccessControl, ReentrancyGuard {
 	
 	bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
 	
+	struct CommonStakingInfo {
+		uint256 rewardsPerEpoch;
+		uint256 startTime;
+		uint256 epochDuration;
+		uint256 rewardsPerDeposit;
+		uint256 rewardProduced;
+		uint256 produceTime;
+		uint256 pastProduced;
+		uint256 totalStaked;
+		uint256 totalDistributed;
+		uint256 fineCoolDownTime;
+		uint256 finePercent;
+		uint256 accumulatedFine;
+		address depositToken;
+		address rewardToken;
+	}
+
 	struct Staker {
 		uint256 amount;
 		uint256 rewardAllowed;
 		uint256 rewardDebt;
 		uint256 distributed;
-		uint256 unstakeRequestApplyTimestamp;
-		uint256 unstakeRequestAmount;
+		uint256 noFineUnstakeOpenSince;
+		uint256 requestedUnstakeAmount;
 	}
 	
 	mapping(address => Staker) public stakers;
@@ -40,10 +57,10 @@ contract Farming is AccessControl, ReentrancyGuard {
 	uint256 public totalStaked;
 	uint256 public totalDistributed;
 	
-	uint256 public fineDuration;
-	uint256 public finePercent;
-	uint256 public accumulatedFine;
 	uint256 public constant precision = 10 ** 20;
+	uint256 public finePercent; // calcs with precision
+	uint256 public fineCoolDownTime;
+	uint256 public accumulatedFine;
 	
 	bool public isStakeAvailable = true;
 	bool public isUnstakeAvailable = true;
@@ -53,11 +70,11 @@ contract Farming is AccessControl, ReentrancyGuard {
 	event tokensClaimed(uint256 amount, uint256 time, address indexed sender);
 	event tokensUnstaked(
 		uint256 amount,
-		uint256 fineAmount,
+		uint256 fineAmount_,
 		uint256 time,
 		address indexed sender
 	);
-	event tokensUnstakeRequest(
+	event requestedTokensUnstake(
 		uint256 amount,
 		uint256 requestApplyTimestamp,
 		uint256 time,
@@ -68,16 +85,14 @@ contract Farming is AccessControl, ReentrancyGuard {
 		uint256 _rewardsPerEpoch,
 		uint256 _startTime,
 		uint256 _epochDuration,
-		uint256 _fineDuration,
+		uint256 _fineCoolDownTime,
 		uint256 _finePercent,
 		address _depositToken,
 		address _rewardToken
-	) public {
+	) {
 		_setupRole(DEFAULT_ADMIN_ROLE, msg.sender);
 		_setupRole(ADMIN_ROLE, msg.sender);
 		_setRoleAdmin(ADMIN_ROLE, DEFAULT_ADMIN_ROLE);
-		
-		require(_rewardsPerEpoch > 0, "Farming: amount of reward must be positive");
 		
 		rewardsPerEpoch = _rewardsPerEpoch;
 		startTime = _startTime;
@@ -86,51 +101,55 @@ contract Farming is AccessControl, ReentrancyGuard {
 		
 		produceTime = _startTime;
 		
-		fineDuration = _fineDuration;
+		fineCoolDownTime = _fineCoolDownTime;
 		finePercent = _finePercent;
 		
 		rewardToken = ERC20(_rewardToken);
 		depositToken = ERC20(_depositToken);
 	}
-	
-	/**
-	 * @dev Calculates the necessary parameters for staking
-	 *
-	 */
-	function produced() private view returns (uint256) {
-		return
-		pastProduced + (rewardsPerEpoch * (block.timestamp - produceTime)) / epochDuration;
+
+	/// @dev withdraw fines to sender by token address, if sender is admin
+	function withdrawFine() external onlyRole(ADMIN_ROLE) {
+		require(accumulatedFine > 0, "Farming: accumulated fine is zero");
+		IERC20(depositToken).safeTransfer(
+			msg.sender,
+			accumulatedFine
+		);
+		accumulatedFine = 0;
 	}
-	
-	function update() public {
-		uint256 rewardProducedAtNow = produced();
-		if (rewardProducedAtNow > rewardProduced) {
-			uint256 producedNew = rewardProducedAtNow - rewardProduced;
-			if (totalStaked > 0) {
-				rewardsPerDeposit = rewardsPerDeposit + producedNew * 1e20 / totalStaked;
-			}
-			rewardProduced += producedNew;
+
+	/// @dev withdrawToken - withdraw token to sender by token address, if sender is admin
+	function withdrawToken(address _token, uint256 _amount) 
+		external
+		onlyRole(ADMIN_ROLE) 
+	{
+		IERC20(_token).safeTransfer(
+			msg.sender,
+			_amount
+		);
+	}
+
+	/// @dev set staking state (in terms of STM)	
+	function setAvailability(bool[] calldata _state) external onlyRole(ADMIN_ROLE) {
+		if (isStakeAvailable != _state[0]) {
+			isStakeAvailable = _state[0];
+		}
+		if (isUnstakeAvailable != _state[1]) {
+			isUnstakeAvailable = _state[1];
+		}
+		if (isClaimAvailable != _state[2]) {
+			isClaimAvailable = _state[2];
 		}
 	}
 	
-	/**
-		* @dev setReward - sets amount of reward during `distributionTime`
-		*/
-	function setReward(uint256 amount) public {
-		require(hasRole(ADMIN_ROLE, msg.sender));
-		pastProduced = produced();
+	/// @dev setReward - sets amount of reward during `distributionTime`
+	function setReward(uint256 _amount) external onlyRole(ADMIN_ROLE){
+		pastProduced = _produced();
 		produceTime = block.timestamp;
-		rewardsPerEpoch = amount;
+		rewardsPerEpoch = _amount;
 	}
 	
-	/**
-	 * @dev stake
-	 *
-	 * Parameters:
-	 *
-	 * - `_amount` - stake amount
-	 */
-	function stake(uint256 _amount) public {
+	function stake(uint256 _amount) external {
 		require(isStakeAvailable, "Farming: stake is not available now");
 		require(
 			block.timestamp > startTime,
@@ -156,34 +175,8 @@ contract Farming is AccessControl, ReentrancyGuard {
 		update();
 		emit tokensStaked(_amount, block.timestamp, msg.sender);
 	}
-	
-	function unstakeWithoutFineRequest(uint256 amount) public payable {
-		require(isUnstakeAvailable, "Farming: unstake is not available now");
-		Staker storage staker = stakers[msg.sender];
-		require(
-			staker.amount >= amount,
-			"Farming: not enough tokens to unstake"
-		);
-		
-		require(
-			staker.unstakeRequestAmount <= amount,
-			"Farming: you already have request with greater or equal amount"
-		);
-		
-		staker.unstakeRequestApplyTimestamp = block.timestamp + fineDuration;
-		staker.unstakeRequestAmount = amount;
-		emit tokensUnstakeRequest(amount, staker.unstakeRequestApplyTimestamp, block.timestamp, msg.sender);
-	}
-	
-	/**
-	 * @dev unstake - return staked amount
-	 *
-	 * Parameters:
-	 *
-	 * - `_amount` - stake amount
-	 */
-	
-	function unstake(uint256 _amount) public nonReentrant payable {
+
+	function unstake(uint256 _amount) external nonReentrant {
 		require(isUnstakeAvailable, "Farming: unstake is not available now");
 		Staker storage staker = stakers[msg.sender];
 		
@@ -197,154 +190,100 @@ contract Farming is AccessControl, ReentrancyGuard {
 		staker.rewardAllowed += (_amount * rewardsPerDeposit / 1e20);
 		staker.amount -= _amount;
 		
-		uint256 unstakeAmount;
-		uint256 fineAmount;
+		uint256 unstakeAmount_;
+		uint256 fineAmount_;
 
 		if (
-			block.timestamp > staker.unstakeRequestApplyTimestamp
-			|| _amount > staker.unstakeRequestAmount
-			|| staker.unstakeRequestApplyTimestamp == 0
-			|| staker.unstakeRequestAmount == 0
+			block.timestamp > staker.noFineUnstakeOpenSince
+			|| _amount > staker.requestedUnstakeAmount
+			|| staker.noFineUnstakeOpenSince == 0
+			|| staker.requestedUnstakeAmount == 0
 		) {
-			fineAmount = finePercent * _amount / precision;
-			unstakeAmount = _amount - fineAmount;
-			accumulatedFine += fineAmount;
+			fineAmount_ = finePercent * _amount / precision;
+			unstakeAmount_ = _amount - fineAmount_;
+			accumulatedFine += fineAmount_;
 			if (
-				staker.unstakeRequestApplyTimestamp == 0
-				|| staker.unstakeRequestAmount == 0
+				staker.noFineUnstakeOpenSince == 0
+				|| staker.requestedUnstakeAmount == 0
 			) {
-				staker.unstakeRequestApplyTimestamp = 0;
-				staker.unstakeRequestAmount = 0;
+				staker.noFineUnstakeOpenSince = 0;
+				staker.requestedUnstakeAmount = 0;
 			}
 		} else {
-			unstakeAmount = _amount;
+			unstakeAmount_ = _amount;
 		}
 		
-		IERC20(depositToken).safeTransfer(msg.sender, unstakeAmount);
+		IERC20(depositToken).safeTransfer(msg.sender, unstakeAmount_);
 		totalStaked -= _amount;
 	
-		emit tokensUnstaked(unstakeAmount, fineAmount, block.timestamp, msg.sender);
+		emit tokensUnstaked(unstakeAmount_, fineAmount_, block.timestamp, msg.sender);
 	}
-	
-	/**
-	 * @dev calcReward - calculates available reward
-	 */
-	function calcReward(address stakerAddress, uint256 _tps)
-	private
-	view
-	returns (uint256)
-	{
-		Staker memory staker = stakers[stakerAddress];
-		return ((staker.amount * _tps) / 1e20) + staker.rewardAllowed - staker.distributed - staker.rewardDebt;
-	}
-	
-	/**
-	 * @dev claim available rewards
-	 */
-	function claim() public nonReentrant {
-		require(isClaimAvailable, "Farming: claim is not available now");
-		if (totalStaked > 0) {
-			update();
-		}
 		
-		uint256 reward = calcReward(msg.sender, rewardsPerDeposit);
-		require(reward > 0, "Farming: nothing to claim");
+	function requestUnstakeWithoutFine(uint256 amount) external {
+		require(isUnstakeAvailable, "Farming: unstake is not available now");
+		Staker storage staker = stakers[msg.sender];
+		require(
+			staker.amount >= amount,
+			"Farming: not enough tokens to unstake"
+		);
+		
+		require(
+			staker.requestedUnstakeAmount <= amount,
+			"Farming: you already have request with greater or equal amount"
+		);
+		
+		staker.noFineUnstakeOpenSince = block.timestamp + fineCoolDownTime;
+		staker.requestedUnstakeAmount = amount;
+		emit requestedTokensUnstake(amount, staker.noFineUnstakeOpenSince, block.timestamp, msg.sender);
+	}
+
+	/// @dev claim available rewards
+	function claim() external nonReentrant {
+		require(isClaimAvailable, "Farming: claim is not available now");
+		if (totalStaked > 0) 
+			update();
+		
+		uint256 reward_ = _calcReward(msg.sender, rewardsPerDeposit);
+		require(reward_ > 0, "Farming: nothing to claim");
 		
 		Staker storage staker = stakers[msg.sender];
 		
-		staker.distributed += reward;
-		totalDistributed += reward;
+		staker.distributed += reward_;
+		totalDistributed += reward_;
 		
-		IERC20(rewardToken).safeTransfer(msg.sender, reward);
-		emit tokensClaimed(reward, block.timestamp, msg.sender);
+		IERC20(rewardToken).safeTransfer(msg.sender, reward_);
+		emit tokensClaimed(reward_, block.timestamp, msg.sender);
 	}
-	
-	/**
-	 * @dev getClaim - returns available reward of `_staker`
-	 */
-	function getClaim(address _staker) public view returns (uint256 reward) {
-		uint256 _rewardsPerDeposit = rewardsPerDeposit;
-		if (totalStaked > 0) {
-			uint256 rewardProducedAtNow = produced();
-			if (rewardProducedAtNow > rewardProduced) {
-				uint256 producedNew = rewardProducedAtNow - rewardProduced;
-				_rewardsPerDeposit += ((producedNew * 1e20) / totalStaked);
+
+	/// @dev core function, must be invoked after any balances changed
+	function update() public {
+		uint256 rewardProducedAtNow_ = _produced();
+		if (rewardProducedAtNow_ > rewardProduced) {
+			uint256 producedNew_ = rewardProducedAtNow_ - rewardProduced;
+			if (totalStaked > 0) {
+				rewardsPerDeposit = rewardsPerDeposit + (producedNew_ * 1e20 / totalStaked);
 			}
+			rewardProduced += producedNew_;
 		}
-		reward = calcReward(_staker, _rewardsPerDeposit);
-		
-		return reward;
+	}
+
+	/// @dev calculates the necessary parameters for staking
+	function _produced() internal view returns (uint256) {
+		return
+		pastProduced + (rewardsPerEpoch * (block.timestamp - produceTime)) / epochDuration;
 	}
 	
-	/**
-	 * @dev getUserInfoByAddress - return staker info by user address
-	 */
-	function getUserInfoByAddress(address user)
-	external
-	view
-	returns (
-		uint256 staked,
-		uint256 available,
-		uint256 claimed
-	)
+	function _calcReward(address _user, uint256 _tps)
+		internal
+		view
+		returns (uint256)
 	{
-		Staker memory staker = stakers[user];
-		staked = staker.amount;
-		available = getClaim(user);
-		claimed = staker.distributed;
-		
-		return (staked, available, claimed);
+		Staker memory staker_ = stakers[_user];
+		return ((staker_.amount * _tps) / 1e20) + 
+			staker_.rewardAllowed - staker_.distributed - staker_.rewardDebt;
 	}
-	
-	/**
-	 * @dev withdrawToken - withdraw token to sender by token address, if sender is admin
-	 */
-	function withdrawToken(address token, uint256 amount) public payable nonReentrant onlyRole(ADMIN_ROLE) {
-		IERC20(token).safeTransfer(
-			msg.sender,
-			amount
-		);
-	}
-	
-	function withdrawFine() public payable nonReentrant onlyRole(ADMIN_ROLE) {
-		require(accumulatedFine > 0, "Farming: accumulated fine is zero");
-		IERC20(depositToken).safeTransfer(
-			msg.sender,
-			accumulatedFine
-		);
-		accumulatedFine = 0;
-	}
-	
-	function setAvailability(bool[] calldata booleans) public onlyRole(ADMIN_ROLE) {
-		if (isStakeAvailable != booleans[0]) {
-			isStakeAvailable = booleans[0];
-		}
-		if (isUnstakeAvailable != booleans[1]) {
-			isUnstakeAvailable = booleans[1];
-		}
-		if (isClaimAvailable != booleans[2]) {
-			isClaimAvailable = booleans[2];
-		}
-	}
-	
-	struct CommonStakingInfo {
-		uint256 rewardsPerEpoch;
-		uint256 startTime;
-		uint256 epochDuration;
-		uint256 rewardsPerDeposit;
-		uint256 rewardProduced;
-		uint256 produceTime;
-		uint256 pastProduced;
-		uint256 totalStaked;
-		uint256 totalDistributed;
-		address depositToken;
-		address rewardToken;
-		uint256 fineDuration;
-		uint256 finePercent;
-		uint256 accumulatedFine;
-	}
-	
-	function getCommonStakingInfo() view public returns(CommonStakingInfo memory) {
+
+	function getCommonStakingInfo() external view returns(CommonStakingInfo memory) {
 		return CommonStakingInfo({
 		rewardsPerEpoch: rewardsPerEpoch,
 		startTime: startTime,
@@ -355,11 +294,38 @@ contract Farming is AccessControl, ReentrancyGuard {
 		pastProduced: pastProduced,
 		totalStaked: totalStaked,
 		totalDistributed: totalDistributed,
-		depositToken: address(depositToken),
-		rewardToken: address(rewardToken),
-		fineDuration: fineDuration,
+		fineCoolDownTime: fineCoolDownTime,
 		finePercent: finePercent,
-		accumulatedFine: accumulatedFine
+		accumulatedFine: accumulatedFine,
+		depositToken: address(depositToken),
+		rewardToken: address(rewardToken)
 		});
+	}
+
+	function getUserInfo(address _user) external view returns (Staker memory) {
+		Staker memory staker = stakers[_user];
+		return Staker({
+			amount: staker.amount,
+			rewardAllowed: getRewardInfo(_user),
+			rewardDebt: staker.rewardDebt,
+			distributed: staker.distributed,
+			noFineUnstakeOpenSince: staker.noFineUnstakeOpenSince,
+			requestedUnstakeAmount: staker.requestedUnstakeAmount
+		});
+	}
+	
+	/// @dev returns available reward of staker
+	function getRewardInfo(address _user) public view returns (uint256) {
+		uint256 rewardsPerDeposit_ = rewardsPerDeposit;
+		if (totalStaked > 0) {
+			uint256 rewardProducedAtNow_ = _produced();
+			if (rewardProducedAtNow_ > rewardProduced) {
+				uint256 producedNew_ = rewardProducedAtNow_ - rewardProduced;
+				rewardsPerDeposit_ += ((producedNew_ * 1e20) / totalStaked);
+			}
+		}
+		uint256 reward_ = _calcReward(_user, rewardsPerDeposit_);
+		
+		return reward_;
 	}
 }
