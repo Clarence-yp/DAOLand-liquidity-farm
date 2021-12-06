@@ -88,6 +88,17 @@ contract Farming is AccessControl, ReentrancyGuard {
         uint256 timestamp,
         address indexed sender
     );
+    event ChangeParamFineCoolDownTime(
+        uint256 fineCoolDownTime,
+        uint256 timestamp
+    );
+    event ChangeParamFinePercent(uint256 finePercent, uint256 timestamp);
+    event SetAvailability(
+        bool isStakeAvailable,
+        bool isUnstakeAvailable,
+        bool isClaimAvailable
+    );
+    event SetReward(uint256 amount);
 
     /**
      *@param _rewardsPerEpoch number of rewards per epoch
@@ -109,8 +120,7 @@ contract Farming is AccessControl, ReentrancyGuard {
     ) {
         _setupRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _setupRole(ADMIN_ROLE, msg.sender);
-        _setRoleAdmin(ADMIN_ROLE, DEFAULT_ADMIN_ROLE);
-
+        require(_finePercent <= 100 * 1e18, "percent>1");
         rewardsPerEpoch = _rewardsPerEpoch;
         startTime = _startTime;
 
@@ -134,6 +144,7 @@ contract Farming is AccessControl, ReentrancyGuard {
         onlyRole(ADMIN_ROLE)
     {
         fineCoolDownTime = _fineCoolDownTime;
+        emit ChangeParamFineCoolDownTime(_fineCoolDownTime, block.timestamp);
     }
 
     /**
@@ -144,7 +155,9 @@ contract Farming is AccessControl, ReentrancyGuard {
         external
         onlyRole(ADMIN_ROLE)
     {
+        require(_finePercent <= 100 * 1e18, "percent>1");
         finePercent = _finePercent;
+        emit ChangeParamFinePercent(finePercent, block.timestamp);
     }
 
     /**
@@ -185,6 +198,12 @@ contract Farming is AccessControl, ReentrancyGuard {
             isUnstakeAvailable = _isUnstakeAvailable;
         if (isClaimAvailable != _isClaimAvailable)
             isClaimAvailable = _isClaimAvailable;
+
+        emit SetAvailability(
+            _isStakeAvailable,
+            _isUnstakeAvailable,
+            _isClaimAvailable
+        );
     }
 
     /**
@@ -195,6 +214,8 @@ contract Farming is AccessControl, ReentrancyGuard {
         pastProduced = _produced();
         produceTime = block.timestamp;
         rewardsPerEpoch = _amount;
+
+        emit SetReward(_amount);
     }
 
     /**
@@ -218,12 +239,11 @@ contract Farming is AccessControl, ReentrancyGuard {
             update();
         }
         Staker storage staker = stakers[msg.sender];
-        staker.rewardDebt += (_amount * rewardsPerDeposit) / 1e20;
+        staker.rewardDebt += (_amount * rewardsPerDeposit) / precision;
 
         totalStaked += _amount;
         staker.amount += _amount;
 
-        update();
         emit TokensStaked(_amount, block.timestamp, msg.sender);
     }
 
@@ -242,7 +262,7 @@ contract Farming is AccessControl, ReentrancyGuard {
 
         update();
 
-        staker.rewardAllowed += ((_amount * rewardsPerDeposit) / 1e20);
+        staker.rewardAllowed += ((_amount * rewardsPerDeposit) / precision);
         staker.amount -= _amount;
 
         uint256 unstakeAmount;
@@ -325,7 +345,7 @@ contract Farming is AccessControl, ReentrancyGuard {
             if (totalStaked > 0) {
                 rewardsPerDeposit =
                     rewardsPerDeposit +
-                    ((producedNew_ * 1e20) / totalStaked);
+                    ((producedNew_ * precision) / totalStaked);
             }
             rewardProduced += producedNew_;
         }
@@ -381,7 +401,8 @@ contract Farming is AccessControl, ReentrancyGuard {
             uint256 rewardProducedAtNow_ = _produced();
             if (rewardProducedAtNow_ > rewardProduced) {
                 uint256 producedNew_ = rewardProducedAtNow_ - rewardProduced;
-                rewardsPerDeposit_ += ((producedNew_ * 1e20) / totalStaked);
+                rewardsPerDeposit_ += ((producedNew_ * precision) /
+                    totalStaked);
             }
         }
         uint256 reward = _calcReward(_user, rewardsPerDeposit_);
@@ -407,7 +428,7 @@ contract Farming is AccessControl, ReentrancyGuard {
     {
         Staker memory staker_ = stakers[_user];
         return
-            ((staker_.amount * _tps) / 1e20) +
+            ((staker_.amount * _tps) / precision) +
             staker_.rewardAllowed -
             staker_.distributed -
             staker_.rewardDebt;
